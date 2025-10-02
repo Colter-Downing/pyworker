@@ -189,45 +189,47 @@ class Backend:
         except Exception as e:
             log.debug(f"Exception in main handler loop {e}")
             return web.Response(status=500)
+        
+    @cached_property  
+    def healthcheck_session(self):
+        """Dedicated session for healthchecks to avoid conflicts with API session"""
+        log.debug("creating dedicated healthcheck session")
+        connector = TCPConnector(
+            force_close=True,  # Keep this for isolation
+            enable_cleanup_closed=True,
+        )
+        timeout = ClientTimeout(total=10)  # Reasonable timeout for healthchecks
+        return ClientSession(timeout=timeout, connector=connector)
 
     async def __healthcheck(self):
         health_check_url = self.benchmark_handler.healthcheck_endpoint
         if health_check_url is None:
             log.debug("No healthcheck endpoint defined, skipping healthcheck")
             return
-        
-        # Create a separate session for healthchecks to avoid conflicts with the main API session
-        healthcheck_connector = TCPConnector(
-            force_close=True,
-            enable_cleanup_closed=True,
-        )
-        healthcheck_timeout = ClientTimeout(total=10)  # 10 second timeout for healthchecks
-        async with ClientSession(timeout=healthcheck_timeout, connector=healthcheck_connector) as health_session:
-            while True:
-                await sleep(10)
-                if self.__start_healthcheck is False:
-                    continue
-                try:
-                    log.debug(f"Performing healthcheck on {health_check_url}")
-                    async with health_session.get(health_check_url) as response:
-                        if response.status == 200:
-                            log.debug("Healthcheck successful BIG POOPY")
-                        elif response.status == 503:
-                            log.debug(f"Healthcheck failed with status: {response.status}")
-                            self.backend_errored(
-                                f"Healthcheck failed with status: {response.status}"
-                            )
-                        else:
-                            # endpoint not ready yet so bail
-                            log.debug(f"Healthcheck Endpoint not ready: {response.status}")
-                except Exception as e:
-                    # Improved error logging with exception type and full details
-                    log.debug(f"Healthcheck failed with exception: {type(e).__name__}: {e}")
-                    log.debug(f"Exception args: {e.args}")
-                    import traceback
-                    log.debug(f"Traceback: {traceback.format_exc()}")
-                    error_msg = f"Healthcheck failed: {type(e).__name__}: {e}" if str(e) else f"Healthcheck failed: {type(e).__name__}"
-                    self.backend_errored(error_msg)
+
+        while True:
+            await sleep(10)
+            if self.__start_healthcheck is False:
+                continue
+            try:
+                log.debug(f"Performing healthcheck on {health_check_url}")
+                async with self.healthcheck_session.get(health_check_url) as response:
+                    if response.status == 200:
+                        log.debug("Healthcheck successful BIG POOPY")
+                    elif response.status == 503:
+                        log.debug(f"Healthcheck failed with status: {response.status}")
+                        self.backend_errored(
+                            f"Healthcheck failed with status: {response.status}"
+                        )
+                    else:
+                        log.debug(f"Healthcheck Endpoint not ready: {response.status}")
+            except Exception as e:
+                log.debug(f"Healthcheck failed with exception: {type(e).__name__}: {e}")
+                log.debug(f"Exception args: {e.args}")
+                import traceback
+                log.debug(f"Traceback: {traceback.format_exc()}")
+                error_msg = f"Healthcheck failed: {type(e).__name__}: {e}" if str(e) else f"Healthcheck failed: {type(e).__name__}"
+                self.backend_errored(error_msg)
 
     async def _start_tracking(self) -> None:
         await gather(
