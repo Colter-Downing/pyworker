@@ -195,26 +195,39 @@ class Backend:
         if health_check_url is None:
             log.debug("No healthcheck endpoint defined, skipping healthcheck")
             return
-        while True:
-            await sleep(10)
-            if self.__start_healthcheck is False:
-                continue
-            try:
-                log.debug(f"Performing healthcheck on {health_check_url}")
-                async with self.session.get(health_check_url) as response:
-                    if response.status == 200:
-                        log.debug("Healthcheck successful")
-                    elif response.status == 503:
-                        log.debug(f"Healthcheck failed with status: {response.status}")
-                        self.backend_errored(
-                            f"Healthcheck failed with status: {response.status}"
-                        )
-                    else:
-                        # endpoint not ready yet so bail
-                        log.debug(f"Healthcheck Endpoint not ready: {response.status}")
-            except Exception as e:
-                log.debug(f"Healthcheck failed with exception: {e}")
-                self.backend_errored(str(e))
+        
+        # Create a separate session for healthchecks to avoid conflicts with the main API session
+        healthcheck_connector = TCPConnector(
+            force_close=True,
+            enable_cleanup_closed=True,
+        )
+        healthcheck_timeout = ClientTimeout(total=10)  # 10 second timeout for healthchecks
+        async with ClientSession(timeout=healthcheck_timeout, connector=healthcheck_connector) as health_session:
+            while True:
+                await sleep(10)
+                if self.__start_healthcheck is False:
+                    continue
+                try:
+                    log.debug(f"Performing healthcheck on {health_check_url}")
+                    async with health_session.get(health_check_url) as response:
+                        if response.status == 200:
+                            log.debug("Healthcheck successful")
+                        elif response.status == 503:
+                            log.debug(f"Healthcheck failed with status: {response.status}")
+                            self.backend_errored(
+                                f"Healthcheck failed with status: {response.status}"
+                            )
+                        else:
+                            # endpoint not ready yet so bail
+                            log.debug(f"Healthcheck Endpoint not ready: {response.status}")
+                except Exception as e:
+                    # Improved error logging with exception type and full details
+                    log.debug(f"Healthcheck failed with exception: {type(e).__name__}: {e}")
+                    log.debug(f"Exception args: {e.args}")
+                    import traceback
+                    log.debug(f"Traceback: {traceback.format_exc()}")
+                    error_msg = f"Healthcheck failed: {type(e).__name__}: {e}" if str(e) else f"Healthcheck failed: {type(e).__name__}"
+                    self.backend_errored(error_msg)
 
     async def _start_tracking(self) -> None:
         await gather(
