@@ -215,7 +215,7 @@ class Backend:
                 log.debug(f"Performing healthcheck on {health_check_url}")
                 async with self.healthcheck_session.get(health_check_url) as response:
                     if response.status == 200:
-                        log.debug("Healthcheck successful BIG POOPY")
+                        log.debug("Healthcheck successful")
                     elif response.status == 503:
                         log.debug(f"Healthcheck failed with status: {response.status}")
                         self.backend_errored(
