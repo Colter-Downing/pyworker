@@ -5,10 +5,12 @@ import base64
 import subprocess
 import dataclasses
 import logging
-from asyncio import wait, sleep, gather, Semaphore, FIRST_COMPLETED, create_task
+from asyncio import wait, sleep, gather, Semaphore, FIRST_COMPLETED, create_task, create_subprocess_exec
+from asyncio.subprocess import PIPE as ASYNC_PIPE
 from typing import Tuple, Awaitable, NoReturn, List, Union, Callable, Optional
 from functools import cached_property
 from distutils.util import strtobool
+from urllib.parse import urlparse
 
 from anyio import open_file
 from aiohttp import web, ClientResponse, ClientSession, ClientConnectorError, ClientTimeout, TCPConnector
@@ -189,7 +191,7 @@ class Backend:
         except Exception as e:
             log.debug(f"Exception in main handler loop {e}")
             return web.Response(status=500)
-        
+
     @cached_property  
     def healthcheck_session(self):
         """Dedicated session for healthchecks to avoid conflicts with API session"""
@@ -224,12 +226,8 @@ class Backend:
                     else:
                         log.debug(f"Healthcheck Endpoint not ready: {response.status}")
             except Exception as e:
-                log.debug(f"Healthcheck failed with exception: {type(e).__name__}: {e}")
-                log.debug(f"Exception args: {e.args}")
-                import traceback
-                log.debug(f"Traceback: {traceback.format_exc()}")
-                error_msg = f"Healthcheck failed: {type(e).__name__}: {e}" if str(e) else f"Healthcheck failed: {type(e).__name__}"
-                self.backend_errored(error_msg)
+                log.debug(f"Healthcheck failed with exception: {e}")
+                self.backend_errored(str(e))
 
     async def _start_tracking(self) -> None:
         await gather(
@@ -350,6 +348,60 @@ class Backend:
             with open(BENCHMARK_INDICATOR_FILE, "w") as f:
                 f.write(str(max_throughput))
             return max_throughput
+        
+        async def run_vllm_benchmark() -> float:
+            log.debug("starting vLLM benchmark via CLI")
+            parsed = urlparse(self.model_server_url)
+            host = parsed.hostname or "localhost"
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+            num_prompts = os.environ.get("VLLM_BENCH_NUM_PROMPTS", "200")
+            in_len = os.environ.get("VLLM_BENCH_INPUT_LEN", "200")
+            out_len = os.environ.get("VLLM_BENCH_OUTPUT_LEN", "200")
+            model = os.environ.get("VLLM_BENCH_MODEL")
+            extra = os.environ.get("VLLM_BENCH_EXTRA_ARGS", "")
+
+            cmd = [
+                "vllm", "bench", "serve",
+                "--host", host,
+                "--port", str(port),
+                "--random-input-len", str(in_len),
+                "--random-output-len", str(out_len),
+                "--num-prompts", str(num_prompts),
+            ]
+            if model:
+                cmd += ["--model", model]
+            if extra:
+                cmd += extra.split()
+
+            try:
+                proc = await create_subprocess_exec(
+                    *cmd, stdout=ASYNC_PIPE, stderr=ASYNC_PIPE
+                )
+                stdout, stderr = await proc.communicate()
+                output = (stdout + b"\n" + stderr).decode("utf-8", errors="ignore")
+                log.debug("vLLM bench serve output:\n" + output)
+
+                max_tp = 0.0
+                patterns = [
+                    r"(?i)tokens per second[^0-9]*([0-9]+(?:\.[0-9]+)?)",
+                    r"(?i)\btok/s\b[^0-9]*([0-9]+(?:\.[0-9]+)?)",
+                    r"(?i)throughput[^0-9]*([0-9]+(?:\.[0-9]+)?)",
+                    r"(?i)output tps[^0-9]*([0-9]+(?:\.[0-9]+)?)",
+                ]
+                for p in patterns:
+                    for m in re.finditer(p, output):
+                        try:
+                            max_tp = max(max_tp, float(m.group(1)))
+                        except Exception:
+                            pass
+                return max_tp
+            except FileNotFoundError:
+                log.debug("vllm CLI not found; ensure vllm[bench] is installed")
+                return 0.0
+            except Exception as e:
+                log.debug(f"vLLM bench serve failed: {e}")
+                return 0.0
 
         async def handle_log_line(log_line: str) -> None:
             """
@@ -366,14 +418,19 @@ class Backend:
                         # they can begin accepting requests
                         await sleep(5)
                         try:
-                            max_throughput = await run_benchmark()
+                            use_vllm_bench = bool(
+                                strtobool(os.environ.get("USE_VLLM_BENCHMARK", "false"))
+                            )
+                            max_throughput = await (
+                                run_vllm_benchmark() if use_vllm_bench else run_benchmark()
+                            )
                             self.__start_healthcheck = True
                             self.metrics._model_loaded(
                                 max_throughput=max_throughput,
                             )
                         except ClientConnectorError as e:
                             log.debug(
-                                f"failed to connect to comfyui api during benchmark"
+                                f"failed to connect to model api during benchmark"
                             )
                             self.backend_errored(str(e))
                     case LogAction.ModelError if msg in log_line:
