@@ -40,6 +40,8 @@ echo_var ENV_PATH
 echo_var DEBUG_LOG
 echo_var PYWORKER_LOG
 echo_var MODEL_LOG
+echo_var USE_VLLM_BENCHMARK
+echo_var AUTO_INSTALL_VLLM_BENCH
 
 # Populate /etc/environment with quoted values
 if ! grep -q "VAST" /etc/environment; then
@@ -71,21 +73,41 @@ then
 
     # Ensure vLLM CLI (bench) is installed if requested
     if [ "${USE_VLLM_BENCHMARK:-false}" = "true" ] || [ "${AUTO_INSTALL_VLLM_BENCH:-false}" = "true" ]; then
-        echo "Installing vllm[bench] (venv creation path)..."
-        if which uv >/dev/null 2>&1; then
-            uv pip install -q "vllm[bench]"
-        else
-            pip install -q "vllm[bench]"
-        fi
+        echo "Installing vllm[bench]..."
+        echo "python: $(python --version)"
+        echo "pip before: $(python -m pip --version || true)"
+        set +e
+        # Make sure build tooling is current
+        python -m pip install --upgrade pip setuptools wheel
+        # Install vllm (print full logs to see failures)
+        python -m pip install "vllm[bench]"
+        install_rc=$?
+        echo "pip after: $(python -m pip --version || true)"
         echo "which vllm: $(command -v vllm || true)"
+
+        echo "Verifying vLLM import..."
         python - <<'PY'
 import sys
 try:
     import vllm
-    print("vLLM python import OK, version:", getattr(vllm, "__version__", "unknown"))
+    print("vLLM import OK, version:", getattr(vllm, "__version__", "unknown"))
 except Exception as e:
     print("vLLM import failed:", e, file=sys.stderr)
+    sys.exit(1)
 PY
+        import_rc=$?
+
+        echo "Verifying vLLM CLI help..."
+        vllm bench serve --help >/dev/null 2>&1 || python -m vllm.entrypoints.cli.main bench serve --help >/dev/null 2>&1
+        cli_rc=$?
+        set -e
+        echo "Install rc=${install_rc} import rc=${import_rc} cli rc=${cli_rc}"
+
+        if [ $install_rc -ne 0 ] || [ $import_rc -ne 0 ] || [ $cli_rc -ne 0 ]; then
+            echo "WARNING: vLLM not ready (install/import/CLI). Check logs above."
+        else
+            echo "vLLM installed and ready."
+        fi
     fi
 
     touch ~/.no_auto_tmux
@@ -98,12 +120,16 @@ else
     # Ensure vLLM CLI (bench) is installed if requested (existing venv path)
     if [ "${USE_VLLM_BENCHMARK:-false}" = "true" ] || [ "${AUTO_INSTALL_VLLM_BENCH:-false}" = "true" ]; then
         echo "Installing vllm[bench] (existing venv path)..."
-        if which uv >/dev/null 2>&1; then
-            uv pip install -q "vllm[bench]"
-        else
-            pip install -q "vllm[bench]"
-        fi
+        echo "python: $(python --version)"
+        echo "pip before: $(python -m pip --version || true)"
+        set +e
+        python -m pip install --upgrade pip setuptools wheel
+        python -m pip install "vllm[bench]"
+        install_rc=$?
+        echo "pip after: $(python -m pip --version || true)"
         echo "which vllm: $(command -v vllm || true)"
+
+        echo "Verifying vLLM import..."
         python - <<'PY'
 import sys
 try:
@@ -111,7 +137,21 @@ try:
     print("vLLM python import OK, version:", getattr(vllm, "__version__", "unknown"))
 except Exception as e:
     print("vLLM import failed:", e, file=sys.stderr)
+    sys.exit(1)
 PY
+        import_rc=$?
+
+        echo "Verifying vLLM CLI help..."
+        vllm bench serve --help >/dev/null 2>&1 || python -m vllm.entrypoints.cli.main bench serve --help >/dev/null 2>&1
+        cli_rc=$?
+        set -e
+        echo "Install rc=${install_rc} import rc=${import_rc} cli rc=${cli_rc}"
+
+        if [ $install_rc -ne 0 ] || [ $import_rc -ne 0 ] || [ $cli_rc -ne 0 ]; then
+            echo "WARNING: vLLM not ready (install/import/CLI). Check logs above."
+        else
+            echo "vLLM installed and ready."
+        fi
     fi
 fi
 
@@ -152,7 +192,6 @@ EOF
         -X \
         POST "https://console.vast.ai/api/v0/sign_cert/?instance_id=$CONTAINER_ID" > /etc/instance.crt;
 fi
-
 
 
 
