@@ -5,6 +5,9 @@ import base64
 import subprocess
 import dataclasses
 import logging
+import re
+import sys
+import shutil
 from asyncio import wait, sleep, gather, Semaphore, FIRST_COMPLETED, create_task, create_subprocess_exec
 from asyncio.subprocess import PIPE as ASYNC_PIPE
 from typing import Tuple, Awaitable, NoReturn, List, Union, Callable, Optional
@@ -351,18 +354,46 @@ class Backend:
         
         async def run_vllm_benchmark() -> float:
             log.debug("starting vLLM benchmark via CLI")
+            log.debug(f"model_server_url={self.model_server_url}")
+            log.debug(f"PATH={os.environ.get('PATH')}")
+            log.debug(f"sys.executable={sys.executable}")
+            log.debug(f"which('vllm')={shutil.which('vllm')}")
+
             parsed = urlparse(self.model_server_url)
             host = parsed.hostname or "localhost"
             port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            log.debug(f"derived host={host} port={port} from model_server_url")
 
             num_prompts = os.environ.get("VLLM_BENCH_NUM_PROMPTS", "200")
             in_len = os.environ.get("VLLM_BENCH_INPUT_LEN", "200")
             out_len = os.environ.get("VLLM_BENCH_OUTPUT_LEN", "200")
             model = os.environ.get("VLLM_BENCH_MODEL")
             extra = os.environ.get("VLLM_BENCH_EXTRA_ARGS", "")
+            auto_install = bool(strtobool(os.environ.get("AUTO_INSTALL_VLLM_BENCH", "false")))
+            log.debug(f"bench args: num_prompts={num_prompts} in_len={in_len} out_len={out_len} model={model} extra='{extra}' auto_install={auto_install}")
 
-            cmd = [
-                "vllm", "bench", "serve",
+            # Optional: try runtime install if CLI missing and allowed
+            if shutil.which("vllm") is None and auto_install:
+                log.debug("vllm CLI not on PATH; attempting 'pip install vllm[bench]'")
+                try:
+                    pip_cmd = [sys.executable, "-m", "pip", "install", "-q", "vllm[bench]"]
+                    log.debug("running: " + " ".join(pip_cmd))
+                    proc_pip = await create_subprocess_exec(*pip_cmd, stdout=ASYNC_PIPE, stderr=ASYNC_PIPE)
+                    pip_out, pip_err = await proc_pip.communicate()
+                    log.debug(f"pip exit={proc_pip.returncode}, stdout_len={len(pip_out)}, stderr_len={len(pip_err)}")
+                    log.debug(f"which('vllm') after install={shutil.which('vllm')}")
+                except Exception as e:
+                    log.debug(f"auto-install failed: {e}")
+
+            # Log whether vLLM python module is importable
+            try:
+                import importlib
+                vllm_mod = importlib.import_module("vllm")
+                log.debug(f"vLLM python module found, version={getattr(vllm_mod, '__version__', 'unknown')}")
+            except Exception as e:
+                log.debug(f"vLLM python module not importable: {e}")
+
+            args = [
                 "--host", host,
                 "--port", str(port),
                 "--random-input-len", str(in_len),
@@ -370,38 +401,60 @@ class Backend:
                 "--num-prompts", str(num_prompts),
             ]
             if model:
-                cmd += ["--model", model]
+                args += ["--model", model]
             if extra:
-                cmd += extra.split()
+                args += extra.split()
 
-            try:
-                proc = await create_subprocess_exec(
-                    *cmd, stdout=ASYNC_PIPE, stderr=ASYNC_PIPE
-                )
-                stdout, stderr = await proc.communicate()
-                output = (stdout + b"\n" + stderr).decode("utf-8", errors="ignore")
-                log.debug("vLLM bench serve output:\n" + output)
+            commands = [
+                ["vllm", "bench", "serve"] + args,
+                [sys.executable, "-m", "vllm.entrypoints.cli.main", "bench", "serve"] + args,
+            ]
+            log.debug("candidate commands:")
+            for c in commands:
+                log.debug("  " + " ".join(c))
 
-                max_tp = 0.0
-                patterns = [
-                    r"(?i)tokens per second[^0-9]*([0-9]+(?:\.[0-9]+)?)",
-                    r"(?i)\btok/s\b[^0-9]*([0-9]+(?:\.[0-9]+)?)",
-                    r"(?i)throughput[^0-9]*([0-9]+(?:\.[0-9]+)?)",
-                    r"(?i)output tps[^0-9]*([0-9]+(?:\.[0-9]+)?)",
-                ]
-                for p in patterns:
-                    for m in re.finditer(p, output):
-                        try:
-                            max_tp = max(max_tp, float(m.group(1)))
-                        except Exception:
-                            pass
-                return max_tp
-            except FileNotFoundError:
-                log.debug("vllm CLI not found; ensure vllm[bench] is installed")
-                return 0.0
-            except Exception as e:
-                log.debug(f"vLLM bench serve failed: {e}")
-                return 0.0
+            last_err = None
+            for cmd in commands:
+                try:
+                    log.debug("running: " + " ".join(cmd))
+                    proc = await create_subprocess_exec(*cmd, stdout=ASYNC_PIPE, stderr=ASYNC_PIPE)
+                    stdout, stderr = await proc.communicate()
+                    output = (stdout + b"\n" + stderr).decode("utf-8", errors="ignore")
+                    log.debug(f"exit={proc.returncode}, stdout_len={len(stdout)}, stderr_len={len(stderr)}")
+                    log.debug("vLLM bench serve output (first 1k chars):\n" + output[:1000])
+
+                    cands = []
+                    max_tp = 0.0
+                    patterns = [
+                        r"(?i)tokens per second[^0-9]*([0-9]+(?:\.[0-9]+)?)",
+                        r"(?i)\btok/s\b[^0-9]*([0-9]+(?:\.[0-9]+)?)",
+                        r"(?i)throughput[^0-9]*([0-9]+(?:\.[0-9]+)?)",
+                        r"(?i)output tps[^0-9]*([0-9]+(?:\.[0-9]+)?)",
+                    ]
+                    for p in patterns:
+                        for m in re.finditer(p, output):
+                            try:
+                                val = float(m.group(1))
+                                cands.append(val)
+                                max_tp = max(max_tp, val)
+                            except Exception:
+                                pass
+                    log.debug(f"throughput candidates parsed: {cands}")
+                    if max_tp == 0.0:
+                        log.debug("no throughput parsed; output tail (500 chars):\n" + output[-500:])
+                    return max_tp
+                except FileNotFoundError as e:
+                    log.debug(f"command not found: {cmd[0]} ({e})")
+                    last_err = e
+                    continue
+                except Exception as e:
+                    log.debug(f"vLLM bench serve failed with {cmd[0]}: {e}")
+                    return 0.0
+
+            log.debug("vLLM CLI not found; ensure vllm[bench] is installed or available in this Python env")
+            if last_err:
+                log.debug(str(last_err))
+            return 0.0
 
         async def handle_log_line(log_line: str) -> None:
             """

@@ -69,12 +69,50 @@ then
 
     uv pip install -r "${SERVER_DIR}/requirements.txt"
 
+    # Ensure vLLM CLI (bench) is installed if requested
+    if [ "${USE_VLLM_BENCHMARK:-false}" = "true" ] || [ "${AUTO_INSTALL_VLLM_BENCH:-false}" = "true" ]; then
+        echo "Installing vllm[bench] (venv creation path)..."
+        if which uv >/dev/null 2>&1; then
+            uv pip install -q "vllm[bench]"
+        else
+            pip install -q "vllm[bench]"
+        fi
+        echo "which vllm: $(command -v vllm || true)"
+        python - <<'PY'
+import sys
+try:
+    import vllm
+    print("vLLM python import OK, version:", getattr(vllm, "__version__", "unknown"))
+except Exception as e:
+    print("vLLM import failed:", e, file=sys.stderr)
+PY
+    fi
+
     touch ~/.no_auto_tmux
 else
     [[ -f ~/.local/bin/env ]] && source ~/.local/bin/env
     source "$WORKSPACE_DIR/worker-env/bin/activate"
     echo "environment activated"
     echo "venv: $VIRTUAL_ENV"
+
+    # Ensure vLLM CLI (bench) is installed if requested (existing venv path)
+    if [ "${USE_VLLM_BENCHMARK:-false}" = "true" ] || [ "${AUTO_INSTALL_VLLM_BENCH:-false}" = "true" ]; then
+        echo "Installing vllm[bench] (existing venv path)..."
+        if which uv >/dev/null 2>&1; then
+            uv pip install -q "vllm[bench]"
+        else
+            pip install -q "vllm[bench]"
+        fi
+        echo "which vllm: $(command -v vllm || true)"
+        python - <<'PY'
+import sys
+try:
+    import vllm
+    print("vLLM python import OK, version:", getattr(vllm, "__version__", "unknown"))
+except Exception as e:
+    print("vLLM import failed:", e, file=sys.stderr)
+PY
+    fi
 fi
 
 [ ! -d "$SERVER_DIR/workers/$BACKEND" ] && echo "$BACKEND not supported!" && exit 1
